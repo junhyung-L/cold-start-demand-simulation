@@ -18,6 +18,7 @@ from typing import List, Dict, Optional, Tuple
 
 import os, re, json, random, math, datetime as dt, hashlib
 import numpy as np, pandas as pd
+from project_config import CACHE_DIR, CALIBRATION_PATH, MODEL_PATH, result_path
 
 # ---------- Optional deps (안 깔려도 동작하도록) ----------
 try:
@@ -114,9 +115,9 @@ def _build_single_turn_prompt(category, concept, price, pack, channels, competit
 
 def save_single_turn_prompt(category, concept, price, pack, channels, competitors, market_size, channel_vocab):
     text = _build_single_turn_prompt(category, concept, price, pack, channels, competitors, market_size, channel_vocab)
-    with open('persona_single_turn_prompt.txt','w',encoding='utf-8') as f: f.write(text)
+    with open(result_path('persona_single_turn_prompt.txt'),'w',encoding='utf-8') as f: f.write(text)
     if _HAS_RL:
-        c = pdfcanvas.Canvas('persona_single_turn_prompt.pdf', pagesize=A4)
+        c = pdfcanvas.Canvas(str(result_path('persona_single_turn_prompt.pdf')), pagesize=A4)
         w,h = A4; y=h-50
         for line in text.split('\n'):
             while len(line)>100:
@@ -306,7 +307,7 @@ def simulate_monthly_demand(personas:List[Persona], cfg:SimulationConfig, cal:Ma
                      'discount_rate':cal.discount_rate[period],'ad_grps':cal.ad_grps[period],
                      'category_season':cal.category_season.get(period,1.0)})
     df=pd.DataFrame(rows)
-    if export_csv: df.to_csv('monthly_forecast.csv',index=False)
+    if export_csv: df.to_csv(result_path('monthly_forecast.csv'),index=False)
     return df
 
 # ---------- 가격 추정 (규칙/모델 통합) ----------
@@ -344,10 +345,10 @@ def _load_price_model():
     global _PRICE_MODEL_CACHE
     if _PRICE_MODEL_CACHE is not None:
         return _PRICE_MODEL_CACHE
-    if not (_HAS_JOBLIB and os.path.exists("price_model.pkl")):
+    if not (_HAS_JOBLIB and MODEL_PATH.exists()):
         return None
     try:
-        _PRICE_MODEL_CACHE = joblib.load("price_model.pkl")
+        _PRICE_MODEL_CACHE = joblib.load(MODEL_PATH)
         return _PRICE_MODEL_CACHE
     except Exception as e:
         print("Price model load failed:", e)
@@ -451,7 +452,7 @@ def _infer_market_size(name:str,c2:str='')->int:
     return int(base*(0.8+h))
 
 # ---------- Calibrated params ----------
-CALIB_PATH = "calibrated_theta.json"
+CALIB_PATH = CALIBRATION_PATH
 def load_calibrated_theta()->Optional[dict]:
     if os.path.exists(CALIB_PATH):
         try:
@@ -517,7 +518,7 @@ def run_scenario(persona_count:int=400, use_llm:bool=False,
                  calendar:Optional[MarketCalendar]=None,
                  ad_effect_mult:float=1.0,
                  feature_text:str="",
-                 persona_cache_dir:str="persona_cache",
+                 persona_cache_dir:str=str(CACHE_DIR),
                  force_llm_regen:bool=False
                  ):
     save_single_turn_prompt(category, concept, price, pack, channels, competitors, market_size, CHANNELS_VOCAB)
@@ -578,7 +579,7 @@ def run_scenario(persona_count:int=400, use_llm:bool=False,
         product_multiplier=product_mult
     )
     forecast=simulate_monthly_demand(personas, cfg, cal, channels, feature_text, export_csv=True)
-    SOURCES.to_json('sources_used.json'); _write_solution_outline(forecast, persona_count, category, concept, price, pack)
+    SOURCES.to_json(result_path('sources_used.json')); _write_solution_outline(forecast, persona_count, category, concept, price, pack)
     return forecast, personas
 
 def _write_solution_outline(forecast:pd.DataFrame, persona_count:int, category:str, concept:str, price:int, pack:str):
@@ -587,10 +588,11 @@ def _write_solution_outline(forecast:pd.DataFrame, persona_count:int, category:s
         f"## 개요\n- 카테고리:{category}\n- 컨셉:{concept}\n- 가격:{price:,} / {pack}\n- 페르소나:{persona_count}\n"
         f"## 핵심결과\n- 12M 합계:{int(forecast['total_units'].sum()):,} EA\n"
         f"- 런칭월:{int(forecast.iloc[0]['total_units']):,} EA\n- 최종월:{int(last['total_units']):,} EA\n")
-    with open('solution_report.md','w',encoding='utf-8') as f: f.write(md)
+    with open(result_path('solution_report.md'),'w',encoding='utf-8') as f: f.write(md)
 
 # ---------- One product → 12m (MC 앙상블) ----------
-def forecast_one_product(row:pd.Series, persona_count:int=400, use_llm:bool=False, mc_runs:int=7)->np.ndarray:
+def forecast_one_product(row:pd.Series, persona_count:int=400, use_llm:bool=False,
+                         mc_runs:int=7, persona_cache_dir:str=str(CACHE_DIR))->np.ndarray:
     global RNG
     name=str(row.get('product_name','')).strip()
     feat=str(row.get('product_feature','')).strip()
@@ -609,18 +611,21 @@ def forecast_one_product(row:pd.Series, persona_count:int=400, use_llm:bool=Fals
     for r in range(mc_runs):
         RNG=np.random.default_rng(seed + r*1337); random.seed(seed + r*7331)
         df,_=run_scenario(persona_count, use_llm, c1 or '식품', feat[:80] or '신제품',
-                          price, pack, channels, competitors, market_size, cal, ad_mult, feature_text=feat)
+                          price, pack, channels, competitors, market_size, cal, ad_mult,
+                          feature_text=feat, persona_cache_dir=persona_cache_dir)
         preds.append(np.maximum(0, np.array(df['total_units'].values)))
     y = np.rint(np.median(np.stack(preds, axis=0), axis=0)).astype(int)
     return y
 
 # ---------- Submission ----------
 def make_submission(product_info_csv:str, out_csv:str='submission.csv', persona_count:int=400,
-                    use_llm:bool=False, mc_runs:int=7)->pd.DataFrame:
+                    use_llm:bool=False, mc_runs:int=7,
+                    persona_cache_dir:str=str(CACHE_DIR))->pd.DataFrame:
     prod=pd.read_csv(product_info_csv)
     rows=[]
     for _,row in prod.iterrows():
-        y=forecast_one_product(row, persona_count, use_llm, mc_runs=mc_runs)
+        y=forecast_one_product(row, persona_count, use_llm, mc_runs=mc_runs,
+                               persona_cache_dir=persona_cache_dir)
         rows.append({'product_name':row['product_name'],
                      **{f'months_since_launch_{i+1}':int(y[i]) for i in range(12)}})
     sub=pd.DataFrame(rows)
@@ -782,8 +787,8 @@ def train_price_model(csv_path="category_prices.csv"):
     print("Train R2:", model.score(X_train, y_train))
     print("Test  R2:", model.score(X_test, y_test))
 
-    joblib.dump(model, "price_model.pkl")
-    print("Saved price_model.pkl")
+    joblib.dump(model, MODEL_PATH)
+    print(f"Saved {MODEL_PATH}")
     return model
 
 # ===================== CLI =====================
@@ -813,7 +818,7 @@ if __name__ == '__main__':
         p_ms.add_argument("--use_llm", type=int, default=0)   # 0/1
         p_ms.add_argument("--mc_runs", type=int, default=7)
         p_ms.add_argument("--force_llm_regen", type=int, default=0)
-        p_ms.add_argument("--persona_cache_dir", default="persona_cache")
+        p_ms.add_argument("--persona_cache_dir", default=str(CACHE_DIR))
 
         args = p.parse_args()
 
@@ -827,7 +832,8 @@ if __name__ == '__main__':
             subdf = make_submission(args.product_csv, args.out_csv,
                                     persona_count=args.persona_count,
                                     use_llm=bool(args.use_llm),
-                                    mc_runs=args.mc_runs)
+                                    mc_runs=args.mc_runs,
+                                    persona_cache_dir=args.persona_cache_dir)
             print(subdf.head())
             print("Files: submission.csv, monthly_forecast.csv, persona_single_turn_prompt.txt/.pdf, sources_used.json, solution_report.md")
 
