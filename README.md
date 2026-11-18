@@ -15,6 +15,8 @@ seasonality) into an explicit input and produces 12-month demand scenarios.
 12-month totals range from 1,941,646 to 7,918,193. Rerunning with the same
 seed reproduces the file exactly. These are scenarios, not forecast accuracy.
 
+**Role.** I wrote the code, analysis, and documentation in this repository.
+
 **Scope.** A simulation with no observed sales or backtest. Data is included;
 `python forecast_pipeline.py make_submission --product_csv data\product_info.csv --use_llm 0`
 runs the rule-based scenario without API keys.
@@ -126,7 +128,7 @@ Naver API credentials. Outputs go to `results/` and `persona_cache/`.
 ```text
 forecast_pipeline.py     maintained CLI: gather_prices, train_price_model, make_submission
 project_config.py        result, cache, model, and calibration paths
-simulation_pipeline.py   separate simplified example, not the maintained engine
+legacy/                  early simplified simulator example, not used by the maintained CLI
 data/                    product list and 15 observed prices
 notebooks/               experiment and final-run notebooks with saved outputs
 results/                 seed-42 run: submission, run summary, report, monthly components, prompt
@@ -137,3 +139,7 @@ results/competition_2025/ competition-run report, monthly forecast, prompt, sour
 
 - [Portfolio case study](PORTFOLIO.md)
 - [Architecture](docs/ARCHITECTURE.md)
+
+## License
+
+No open-source license: the code and documents are public for review; reuse requires permission.

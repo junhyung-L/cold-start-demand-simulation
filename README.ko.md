@@ -6,6 +6,8 @@
 
 **결과.** seed 42, 규칙 기반 페르소나 400명, 관측 정가로 실행하면 프리미엄 참치액 조미소스 900g의 12개월 합계는 3,070,766개입니다(Monte Carlo 7회의 월별 중앙값). 15종 제품의 12개월 합계는 1,941,646개에서 7,918,193개 사이입니다. 같은 seed로 다시 실행하면 파일이 그대로 재현됩니다. 예측 정확도가 아니라 시나리오 결과입니다.
 
+**역할.** 이 저장소의 코드·분석·문서를 직접 작성했습니다.
+
 **범위.** 실제 판매량이나 백테스트가 없는 시뮬레이션입니다. 데이터는 포함되어 있으며, `python forecast_pipeline.py make_submission --product_csv data\product_info.csv --use_llm 0`로 API 키 없이 규칙 기반 시나리오를 실행할 수 있습니다.
 
 [English](README.md) · [사례 연구](PORTFOLIO.ko.md) · [아키텍처](docs/ARCHITECTURE.md)
@@ -84,7 +86,7 @@ python forecast_pipeline.py train_price_model    # leave-one-out 가격 비교
 ```text
 forecast_pipeline.py     유지 중인 CLI: gather_prices, train_price_model, make_submission
 project_config.py        결과·캐시·모델·보정 파일 경로
-simulation_pipeline.py   별도의 단순화 예제(유지 중인 엔진 아님)
+legacy/                  초기 단순화 시뮬레이터 예제, 유지 중인 CLI에서 쓰지 않음
 data/                    제품 목록과 관측 가격 15건
 notebooks/               출력이 저장된 실험·최종 실행 노트북
 results/                 seed 42 실행: 제출 파일, 실행 요약, 보고서, 월별 구성 요소, 프롬프트
@@ -95,3 +97,7 @@ results/competition_2025/ 대회 실행 보고서, 월별 예측, 프롬프트, 
 
 - [포트폴리오 사례 연구](PORTFOLIO.ko.md)
 - [아키텍처](docs/ARCHITECTURE.md)
+
+## 라이선스
+
+오픈소스 라이선스 없음: 코드와 문서는 열람용으로 공개하며, 재사용하려면 허락이 필요합니다.
