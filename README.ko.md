@@ -6,6 +6,8 @@
 
 **결과.** 페르소나 3명으로 한 번 실행한 결과, 프리미엄 참치액 조미소스 900g의 12개월 합계는 7,207,421개입니다. 예측 정확도가 아니라 시나리오 결과입니다.
 
+**범위.** 실제 판매량이나 백테스트가 없는 시뮬레이션이며, 페르소나 3명을 모든 몬테카를로 실행에 재사용했고 가격은 모든 제품이 같습니다. 데이터는 포함되어 있으며, `python forecast_pipeline.py make_submission --product_csv data\product_info.csv --use_llm 0`로 API 키 없이 규칙 기반 시나리오를 실행할 수 있습니다.
+
 [English](README.md) · [사례 연구](PORTFOLIO.ko.md) · [아키텍처](docs/ARCHITECTURE.md)
 
 ## 데이터와 가정

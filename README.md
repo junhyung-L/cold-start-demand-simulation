@@ -13,6 +13,12 @@ seasonality) into an explicit input and produces 12-month demand scenarios.
 seasoning sauce totals 7,207,421 simulated units over 12 months. This is a
 scenario, not a forecast-accuracy result.
 
+**Scope.** A simulation with no observed sales or backtest; the 3 personas were
+reused across all Monte Carlo runs, and price is the same for every product.
+Data is included;
+`python forecast_pipeline.py make_submission --product_csv data\product_info.csv --use_llm 0`
+runs a rule-based scenario without API keys.
+
 [한국어](README.ko.md) · [Case study](PORTFOLIO.md) · [Architecture](docs/ARCHITECTURE.md)
 
 ## Data and assumptions
