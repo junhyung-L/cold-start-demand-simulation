@@ -9,15 +9,15 @@ before any sales exist, so a forecasting model has no target. The simulator
 turns each assumption (price, promotion, advertising, distribution,
 seasonality) into an explicit input and produces 12-month demand scenarios.
 
-**Result.** In a single run with 3 personas, a 900 g premium tuna-extract
-seasoning sauce totals 7,207,421 simulated units over 12 months. This is a
-scenario, not a forecast-accuracy result.
+**Result.** With seed 42, 400 rule-based personas, and observed list prices, a
+900 g premium tuna-extract seasoning sauce totals 3,070,766 simulated units over
+12 months (per-month median of 7 Monte Carlo runs); across the 15 products,
+12-month totals range from 1,941,646 to 7,918,193. Rerunning with the same
+seed reproduces the file exactly. These are scenarios, not forecast accuracy.
 
-**Scope.** A simulation with no observed sales or backtest; the 3 personas were
-reused across all Monte Carlo runs, and price is the same for every product.
-Data is included;
+**Scope.** A simulation with no observed sales or backtest. Data is included;
 `python forecast_pipeline.py make_submission --product_csv data\product_info.csv --use_llm 0`
-runs a rule-based scenario without API keys.
+runs the rule-based scenario without API keys.
 
 [한국어](README.ko.md) · [Case study](PORTFOLIO.md) · [Architecture](docs/ARCHITECTURE.md)
 
@@ -27,7 +27,7 @@ runs a rule-based scenario without API keys.
   feature text (ingredients, advertising months, ad model), and a three-level
   category.
 - [`data/category_prices.csv`](data/category_prices.csv): 15 list prices
-  collected from Naver Shopping on 2025-08-26.
+  collected from Naver Shopping on 2025-08-26, one listing per product.
 - Hand-set defaults in `forecast_pipeline.py`: base awareness 0.18, trial rate
   0.35, repeat rate 0.55, price elasticity -1.2, ad effect 0.10 per 100 GRP
   (gross rating points), promotion pass-through 0.8. Market size is a
@@ -37,14 +37,14 @@ runs a rule-based scenario without API keys.
 
 ```mermaid
 flowchart LR
-    A[Product metadata] --> B[Persona generation<br/>Gemini with cache, or rule-based fallback]
-    C[Competitor price observations] --> D[LightGBM price model<br/>or rule-based price table]
+    A[Product metadata] --> B[Persona generation<br/>rule-based, or Gemini with cache]
+    C[Observed list prices] --> D[Price input<br/>observed, else category median]
     A --> H[Market calendar<br/>ads, discounts, distribution, seasonality]
     B --> E[Monthly purchase simulation]
     D --> E
     H --> E
     E --> F[Monte Carlo runs<br/>median per month]
-    F --> G[Submission CSV and scenario artifacts]
+    F --> G[Submission CSV and run summary]
 ```
 
 Each persona gets a purchase utility from its attributes, price, discounts,
@@ -53,42 +53,72 @@ x mean purchase probability; repeat units grow with cumulative trials. Each
 product runs several Monte Carlo times and the submission keeps the per-month
 median. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+**Reproducibility.** Every random draw comes from a NumPy generator seeded by
+`--seed` (default 42) plus a CRC32 hash of the product name, so output does not
+depend on `PYTHONHASHSEED`. Two runs with seed 42, one under
+`PYTHONHASHSEED=123`, wrote identical submissions; seed 7 wrote a different one.
+
+**Personas.** The rule-based path generates exactly `--persona_count`
+personas per Monte Carlo run. When an LLM or its cache returns fewer, the
+pipeline logs a warning with the actual count and records it in
+`results/run_summary.csv`.
+
+**Price input.** Each product uses, in order: a `price` or `list_price`
+column in `product_info.csv` if present, its observed list price, a saved
+LightGBM model, the median observed price of its category, then a hand-set
+unit-price table. `train_price_model` saves the model only if it beats the
+category median on leave-one-out over the 15 observed prices. It does not:
+
+| Leave-one-out, 15 prices | MAE (KRW) | MAPE |
+|---|---:|---:|
+| Category median (baseline) | 4,920 | 101.3% |
+| LightGBM, competition settings | 7,722 | 147.3% |
+| LightGBM, small-data settings | 9,474 | 196.1% |
+
+So no model is saved and all 15 products run on their observed price. The
+competition-time model, trained on 12 rows, found no split (train R² 0.0000,
+test R² -0.1779) and returned KRW 14,093 for every product.
+
 ## Results
 
-| Single run, 3 personas (premium seasoning sauce 900 g) | Value |
+`results/submission.csv`, seed 42, 400 rule-based personas, 7 Monte Carlo runs:
+
+| Premium seasoning sauce 900 g | Value |
 |---|---:|
-| Month 1 simulated units | 123,287 |
-| Month 12 simulated units | 1,321,951 |
-| 12-month total | 7,207,421 |
-| Price input | KRW 14,093 |
+| Month 1 simulated units | 54,580 |
+| Month 12 simulated units | 471,831 |
+| 12-month total | 3,070,766 |
+| Price input (observed) | KRW 22,400 |
 
 Growth comes from the assumed distribution ramp (35% to 100% coverage) and
 repeat purchases that scale with cumulative trial units. Trial units are not
 removed from the untried pool, so cumulative trial units are purchase volume,
-not unique buyers.
+not unique buyers. Per-product prices, market sizes, persona counts, and seeds
+are in `results/run_summary.csv`.
+
+The competition run (Gemini, 3 personas, constant KRW 14,093 price) gave
+7,207,421 units for the same product in one Monte Carlo run; its files are kept
+in `results/competition_2025/`.
 
 ## How to run
 
 ```powershell
 pip install -r requirements.txt
-python forecast_pipeline.py make_submission `
-  --product_csv data\product_info.csv `
-  --out_csv results\submission.csv `
-  --use_llm 0 --persona_count 400 --mc_runs 7
+python forecast_pipeline.py make_submission --product_csv data\product_info.csv --use_llm 0
+python forecast_pipeline.py make_submission --product_csv data\product_info.csv --use_llm 0 --seed 7 --persona_count 400 --mc_runs 7
+python forecast_pipeline.py train_price_model    # leave-one-out price comparison
 ```
 
-`--use_llm 0` uses rule-based personas and needs no API key. Gemini personas
-(`--use_llm 1`) need `GOOGLE_API_KEY` and the `google-generativeai` package;
-`gather_prices` needs Naver API credentials. Without `results/price_model.pkl`
-the rule-based price table is used, so a fresh run will differ from the
-scenario above. Reruns are not bit-identical unless `PYTHONHASHSEED` is fixed.
-Outputs go to `results/` and `persona_cache/`.
+The first command takes about 40 seconds. `--use_llm 0` uses rule-based
+personas and needs no API key. Gemini personas (`--use_llm 1`) need
+`GOOGLE_API_KEY` and the `google-generativeai` package; `gather_prices` needs
+Naver API credentials. Outputs go to `results/` and `persona_cache/`.
 
 ## Limitations
 
 - Simulation, not forecast: no observed sales, backtest, or competition score.
-- Only 3 personas: `persona_count` was 400, but Gemini returned 3 personas for this product, and those 3 were reused across all seven Monte Carlo runs.
-- Price does not differentiate products: the LightGBM price model, trained on 12 of the 15 observed prices, found no split (train R² 0.0000, test R² -0.1779) and returns KRW 14,093 for every product.
+- Observed prices are one listing each and do not track pack size (90 g at KRW 19,050, 135 g at KRW 16,275), so the price effect inherits that noise.
+- Rule-based personas are random draws, not fitted to survey or panel data.
 - No sensitivity sweep, so which assumption moves the total most is unmeasured.
 
 ## Repository layout
@@ -99,7 +129,8 @@ project_config.py        result, cache, model, and calibration paths
 simulation_pipeline.py   separate simplified example, not the maintained engine
 data/                    product list and 15 observed prices
 notebooks/               experiment and final-run notebooks with saved outputs
-results/                 scenario report, monthly forecast, prompt, sources, submission file
+results/                 seed-42 run: submission, run summary, report, monthly components, prompt
+results/competition_2025/ competition-run report, monthly forecast, prompt, sources, submission
 ```
 
 ## Documentation

@@ -9,14 +9,18 @@ Integrated pipeline with persona caching:
 Run examples (CLI):
   1) 가격 수집:         python forecast_pipeline.py gather_prices --product_csv product_info.csv
   2) 가격모델 학습:     python forecast_pipeline.py train_price_model --prices_csv category_prices.csv
-  3) 제출파일 생성:     python forecast_pipeline.py make_submission --product_csv product_info.csv --use_llm 0 --mc_runs 7
+  3) 제출파일 생성:     python forecast_pipeline.py make_submission --product_csv product_info.csv --use_llm 0 --mc_runs 7 --seed 42
+
+Reproducibility: every random draw comes from an explicit np.random.Generator
+seeded from --seed plus a stable CRC32 hash of the product name, so the same
+seed gives identical output regardless of PYTHONHASHSEED.
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 
-import os, re, json, random, math, datetime as dt, hashlib
+import os, re, json, math, datetime as dt, hashlib, logging, zlib
 import numpy as np, pandas as pd
 from project_config import CACHE_DIR, CALIBRATION_PATH, MODEL_PATH, result_path
 
@@ -44,8 +48,15 @@ except Exception:
 FORECAST_START = dt.date(2024,7,1)
 FORECAST_END   = dt.date(2025,6,30)
 MONTHS = pd.period_range(FORECAST_START, FORECAST_END, freq='M')
-RNG = np.random.default_rng(42)
-random.seed(42)
+DEFAULT_SEED = 42
+LOG = logging.getLogger("forecast_pipeline")
+
+def stable_hash(text: str) -> int:
+    """Process-independent hash (CRC32), unlike built-in hash() which depends on PYTHONHASHSEED."""
+    return zlib.crc32(str(text).encode("utf-8"))
+
+def product_seed(base_seed: int, name: str) -> int:
+    return (int(base_seed) + stable_hash(name)) % (2**32)
 
 # ---------- Sources registry ----------
 class SourcesRegistry:
@@ -175,35 +186,41 @@ class LLMAdapter:
 GENDERS=['남','여']; REGIONS=['서울','수도권','광역시','기타']
 INCOME=['~2천','2-4천','4-7천','7천~']; LIFESTYLES=['활동적','가성비','워라밸','건강지향','육아','미식','트렌디','야근많음']
 
-def _rand_weights()->Dict[str,float]:
-    return {a: float(np.clip(np.random.normal(0,0.7),-2,2)) for a in ATTRIBUTES}
+def _rand_weights(rng:np.random.Generator)->Dict[str,float]:
+    return {a: float(np.clip(rng.normal(0,0.7),-2,2)) for a in ATTRIBUTES}
 
-def _rand_monthly_pattern()->List[float]:
+def _rand_monthly_pattern(rng:np.random.Generator)->List[float]:
     base=np.ones(12)
     for k,v in {2:1.08, 8:1.10, 9:1.06}.items(): base[k]*=v  # 설/추석 부근
-    base*=np.random.normal(1.0,0.05,12)
+    base*=rng.normal(1.0,0.05,12)
     pat=(base/base.mean())
-    return list(np.clip(pat,0.6,1.4))
+    return [float(x) for x in np.clip(pat,0.6,1.4)]
 
-def generate_personas_rule_based(n:int)->List[Persona]:
+def _pick(rng:np.random.Generator, options:list):
+    return options[int(rng.integers(len(options)))]
+
+def generate_personas_rule_based(n:int, rng:np.random.Generator)->List[Persona]:
+    """Generate exactly n distinct personas from the given generator (deterministic per seed)."""
     out=[]
     for i in range(n):
         out.append(Persona(
             persona_id=f"P{i+1:03d}", name=f"홍길{'동' if i%2==0 else '순'}{i%10}",
-            age=int(np.random.randint(20,66)), gender=random.choice(GENDERS),
-            region=random.choice(REGIONS), household_size=int(np.random.randint(1,5)),
-            income_band=random.choice(INCOME), lifestyle=random.choice(LIFESTYLES),
-            health_focus=float(np.clip(np.random.beta(2,3),0,1)),
-            price_sensitivity=float(np.clip(np.random.beta(3,2),0,1)),
-            brand_loyalty=float(np.clip(np.random.beta(2,4),0,1)),
-            online_offline_mix=float(np.random.rand()),
-            channel_preference=random.choice(CHANNELS_VOCAB),
-            promo_reactivity=float(np.clip(np.random.beta(2,2),0,1)),
-            ad_reach_susceptibility=float(np.clip(np.random.beta(2,2),0,1)),
-            environmental_concern=float(np.clip(np.random.beta(2,3),0,1)),
-            innovation_seeker=float(np.clip(np.random.beta(2,2),0,1)),
-            weights=_rand_weights(), monthly_pattern=_rand_monthly_pattern()
+            age=int(rng.integers(20,66)), gender=_pick(rng,GENDERS),
+            region=_pick(rng,REGIONS), household_size=int(rng.integers(1,5)),
+            income_band=_pick(rng,INCOME), lifestyle=_pick(rng,LIFESTYLES),
+            health_focus=float(np.clip(rng.beta(2,3),0,1)),
+            price_sensitivity=float(np.clip(rng.beta(3,2),0,1)),
+            brand_loyalty=float(np.clip(rng.beta(2,4),0,1)),
+            online_offline_mix=float(rng.random()),
+            channel_preference=_pick(rng,CHANNELS_VOCAB),
+            promo_reactivity=float(np.clip(rng.beta(2,2),0,1)),
+            ad_reach_susceptibility=float(np.clip(rng.beta(2,2),0,1)),
+            environmental_concern=float(np.clip(rng.beta(2,3),0,1)),
+            innovation_seeker=float(np.clip(rng.beta(2,2),0,1)),
+            weights=_rand_weights(rng), monthly_pattern=_rand_monthly_pattern(rng)
         ))
+    if len(out)!=n:
+        raise RuntimeError(f"rule-based persona generation returned {len(out)} personas, expected {n}")
     return out
 
 # ---------- Demand model ----------
@@ -270,7 +287,7 @@ def _persona_utility(p:Persona, mi:int, cfg:SimulationConfig, cal:MarketCalendar
         val=getattr(p,k,None)
         if val is None: continue
         if isinstance(val,str) and k in ('gender','region','income_band','channel_preference','lifestyle'):
-            val_num=(hash((k,val))%7)/6.0
+            val_num=(stable_hash(f"{k}|{val}")%7)/6.0
         else:
             val_num=float(val) if not isinstance(val,str) else 0.5
         wsum+=v*val_num
@@ -287,7 +304,8 @@ def _persona_utility(p:Persona, mi:int, cfg:SimulationConfig, cal:MarketCalendar
 
 def simulate_monthly_demand(personas:List[Persona], cfg:SimulationConfig, cal:MarketCalendar,
                             current_channels:List[str], feature_text:str,
-                            export_csv=True)->pd.DataFrame:
+                            export_csv=True, rng:Optional[np.random.Generator]=None)->pd.DataFrame:
+    if rng is None: rng=np.random.default_rng(DEFAULT_SEED)
     rows=[]; cum_trials=0.0
     for mi,period in enumerate(MONTHS):
         probs=[]
@@ -300,7 +318,7 @@ def simulate_monthly_demand(personas:List[Persona], cfg:SimulationConfig, cal:Ma
         exp_trials=cfg.population*np.mean(probs)*cfg.product_multiplier
         cum_trials+=exp_trials
         repeats=cfg.repeat_rate*cum_trials*0.2
-        demand=max(0.0,(exp_trials+repeats)*math.exp(np.random.normal(0,cfg.noise_sd)))
+        demand=max(0.0,(exp_trials+repeats)*math.exp(rng.normal(0,cfg.noise_sd)))
         rows.append({'month':period.to_timestamp('M'),
                      'trial_units':exp_trials,'repeat_units':repeats,'total_units':demand,
                      'distribution':cal.distribution[period],'avg_price':cal.price_krw[period],
@@ -340,57 +358,120 @@ def _estimate_list_price_rule(row:pd.Series)->int:
     prem=sum(v for k,v in _PREMIUM_TABLE.items() if k in feat) + (0.10 if '프리미엄' in name else 0)
     return int(round(price*(1.0+prem),-1))
 
+# Price resolution order (see README "Price input"):
+#   1. a price column in product_info.csv (price / list_price), if present
+#   2. the product's observed list price in data/category_prices.csv
+#   3. the LightGBM model, only if train_price_model saved one that beat the
+#      category-median baseline on leave-one-out evaluation
+#   4. median observed price of the same category (level 3 -> 2 -> 1)
+#   5. the hand-set unit-price rule table
+PRICES_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "category_prices.csv")
+_CAT_LEVELS = ["category_level_3", "category_level_2", "category_level_1"]
+_CAT_COLS = ["category_level_1", "category_level_2", "category_level_3"]
+
+def load_observed_prices(path:str=PRICES_CSV)->pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["product_name", *_CAT_LEVELS, "list_price"])
+    df = pd.read_csv(path)
+    df["list_price"] = pd.to_numeric(df["list_price"], errors="coerce")
+    return df.dropna(subset=["list_price"]).reset_index(drop=True)
+
+def category_median_price(row, observed:pd.DataFrame, exclude_name:Optional[str]=None)->Tuple[Optional[float],str]:
+    """Median observed price among products in the same category, most specific level first."""
+    pool = observed if exclude_name is None else observed[observed["product_name"] != exclude_name]
+    for level in _CAT_LEVELS:
+        val = row.get(level)
+        if val is None or level not in pool.columns: continue
+        match = pool[pool[level] == val]["list_price"]
+        if len(match):
+            return float(match.median()), f"category_median({level})"
+    if len(pool):
+        return float(pool["list_price"].median()), "overall_median"
+    return None, "none"
+
+def _given_price(row)->Optional[float]:
+    for col in ("price", "list_price"):
+        if col in row.index:
+            v = pd.to_numeric(row.get(col), errors="coerce")
+            if pd.notna(v) and v > 0:
+                return float(v)
+    return None
+
+def _price_features(df:pd.DataFrame)->pd.DataFrame:
+    names = df["product_name"].astype(str)
+    X = pd.DataFrame(index=df.index)
+    X["pack_size_value"] = names.map(lambda n: int(''.join(c for c in n if c.isdigit()) or 0))
+    X["pack_size_unit"] = names.map(lambda n: 0 if "g" in n.lower() else 1)
+    feat = df["product_feature"].astype(str) if "product_feature" in df.columns else pd.Series("", index=df.index)
+    text = names + " " + feat
+    X["is_premium"] = text.str.contains("프리미엄|premium", case=False, regex=True).astype(int)
+    X["is_high_protein"] = text.str.contains("고단백").astype(int)
+    X["is_lactofree"] = text.str.contains("락토프리").astype(int)
+    for c in _CAT_COLS:
+        X[c] = (df[c] if c in df.columns else pd.Series("NA", index=df.index)).astype(str).astype("category")
+    return X
+
+def _make_lgbm(small_data:bool):
+    if small_data:  # let trees split on very few rows
+        return lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05, max_depth=3,
+                                 min_child_samples=2, min_data_in_bin=1, verbose=-1)
+    return lgb.LGBMRegressor(n_estimators=500, learning_rate=0.05, max_depth=7, verbose=-1)  # original settings
+
 _PRICE_MODEL_CACHE = None
 def _load_price_model():
+    """Load a gated model bundle; ignore legacy pickles saved without a baseline comparison."""
     global _PRICE_MODEL_CACHE
     if _PRICE_MODEL_CACHE is not None:
-        return _PRICE_MODEL_CACHE
+        return _PRICE_MODEL_CACHE or None
+    _PRICE_MODEL_CACHE = False
     if not (_HAS_JOBLIB and MODEL_PATH.exists()):
         return None
     try:
-        _PRICE_MODEL_CACHE = joblib.load(MODEL_PATH)
-        return _PRICE_MODEL_CACHE
+        bundle = joblib.load(MODEL_PATH)
     except Exception as e:
-        print("Price model load failed:", e)
+        LOG.warning("Price model load failed: %s", e)
         return None
+    if not (isinstance(bundle, dict) and bundle.get("beats_baseline")):
+        LOG.warning("Ignoring %s: not a gated model bundle (rerun train_price_model).", MODEL_PATH)
+        return None
+    _PRICE_MODEL_CACHE = bundle
+    return bundle
 
 def _estimate_list_price_model(row:pd.Series)->Optional[int]:
-    model = _load_price_model()
-    if model is None: return None
-
-    name = str(row.get("product_name","")) or ""
-    size = int(''.join([c for c in name if c.isdigit()]) or 0)
-    unit = 0 if "g" in name.lower() else 1
-    feat = str(row.get("product_feature","")) or ""
-
-    X = pd.DataFrame([{
-        "pack_size_value": size,
-        "pack_size_unit": unit,
-        "category_level_1": row.get("category_level_1","NA"),
-        "category_level_2": row.get("category_level_2","NA"),
-        "category_level_3": row.get("category_level_3","NA"),
-        "is_premium": int("프리미엄" in (name+feat) or "premium" in (name+feat).lower()),
-        "is_high_protein": int(("고단백" in (name+feat))),
-        "is_lactofree": int(("락토프리" in (name+feat)))
-    }])
-
-    # dtype 맞추기 (학습과 동일)
-    X["pack_size_value"] = pd.to_numeric(X["pack_size_value"], errors="coerce").fillna(0).astype(int)
-    X["pack_size_unit"]  = pd.to_numeric(X["pack_size_unit"], errors="coerce").fillna(0).astype(int)
-    for c in ["category_level_1","category_level_2","category_level_3"]:
-        X[c] = X[c].astype("string").fillna("NA").astype("category")
-
+    bundle = _load_price_model()
+    if bundle is None: return None
+    X = _price_features(pd.DataFrame([row]))
+    for c in _CAT_COLS:
+        X[c] = X[c].astype(str).astype(pd.CategoricalDtype(bundle["categories"][c]))
     try:
-        return int(float(model.predict(X)[0]))
+        return int(float(bundle["model"].predict(X)[0]))
     except Exception as e:
-        print("Price model predict failed:", e)
+        LOG.warning("Price model predict failed: %s", e)
         return None
 
-# 최종 통합 진입점: 모델 → 규칙 폴백
-def _estimate_list_price(row:pd.Series)->int:
+_OBSERVED_PRICES = None
+def resolve_price(row:pd.Series)->Tuple[int,str]:
+    """Return (price in KRW, source label) following the order documented above."""
+    global _OBSERVED_PRICES
+    if _OBSERVED_PRICES is None:
+        _OBSERVED_PRICES = load_observed_prices()
+    given = _given_price(row)
+    if given is not None:
+        return int(round(given)), "product_info"
+    name = str(row.get("product_name", "")).strip()
+    hit = _OBSERVED_PRICES[_OBSERVED_PRICES["product_name"].astype(str).str.strip() == name]
+    if len(hit):
+        return int(round(float(hit["list_price"].iloc[0]))), "observed"
     p = _estimate_list_price_model(row)
-    if p is not None: return p
-    return _estimate_list_price_rule(row)
+    if p is not None:
+        return p, "model"
+    med, src = category_median_price(row, _OBSERVED_PRICES)
+    if med is not None:
+        return int(round(med)), src
+    return _estimate_list_price_rule(row), "rule_table"
+
+def _estimate_list_price(row:pd.Series)->int:
+    return resolve_price(row)[0]
 
 # ---------- 텍스트 → 가격/GRP/ACV/유통 강화 ----------
 def _parse_month_ranges(text:str)->List[int]:
@@ -448,7 +529,7 @@ def _infer_market_size(name:str,c2:str='')->int:
     elif '조미' in c2: base=5_000_000
     elif '축산캔' in c2: base=4_000_000
     elif '커피' in c2: base=12_000_000
-    h=(abs(hash(name))%41)/100.0
+    h=(stable_hash(name)%41)/100.0
     return int(base*(0.8+h))
 
 # ---------- Calibrated params ----------
@@ -519,19 +600,26 @@ def run_scenario(persona_count:int=400, use_llm:bool=False,
                  ad_effect_mult:float=1.0,
                  feature_text:str="",
                  persona_cache_dir:str=str(CACHE_DIR),
-                 force_llm_regen:bool=False
+                 force_llm_regen:bool=False,
+                 rng:Optional[np.random.Generator]=None,
+                 product_name:str="",
+                 write_artifacts:bool=True
                  ):
-    save_single_turn_prompt(category, concept, price, pack, channels, competitors, market_size, CHANNELS_VOCAB)
+    if rng is None: rng = np.random.default_rng(DEFAULT_SEED)
+    if write_artifacts:
+        save_single_turn_prompt(category, concept, price, pack, channels, competitors, market_size, CHANNELS_VOCAB)
 
     personas = None
+    persona_source = None
 
     # 캐시 키 계산 및 로드
     cache_key = _scenario_signature(
         category, concept, price, pack, channels, competitors, market_size,
         persona_count, model_name="gemini-1.5-flash-latest"
     )
-    if not force_llm_regen:
+    if use_llm and not force_llm_regen:
         personas = load_personas_cache(persona_cache_dir, cache_key)
+        if personas: persona_source = "llm_cache"
 
     # LLM 생성 + 캐시 저장
     if personas is None:
@@ -542,14 +630,20 @@ def run_scenario(persona_count:int=400, use_llm:bool=False,
                     _build_single_turn_prompt(category, concept, price, pack, channels, competitors, market_size, CHANNELS_VOCAB)
                 )
                 if personas:
+                    persona_source = "llm"
                     save_personas_cache(personas, persona_cache_dir, cache_key)
             except Exception as e:
                 print(f"[run_scenario] LLM 사용 실패: {e} → 규칙기반으로 진행")
                 personas = None
 
-    # 규칙기반 폴백
-    if personas is None:
-        personas = generate_personas_rule_based(persona_count)
+    # 규칙기반 폴백 (exactly persona_count personas, deterministic per rng)
+    if not personas:
+        personas = generate_personas_rule_based(persona_count, rng)
+        persona_source = "rule_based"
+
+    if len(personas) != persona_count:
+        LOG.warning("[personas] %s: requested %d, %s returned %d; simulating with %d personas",
+                    product_name or concept, persona_count, persona_source, len(personas), len(personas))
 
     cal = calendar or default_calendar(price)
 
@@ -578,28 +672,32 @@ def run_scenario(persona_count:int=400, use_llm:bool=False,
         noise_sd=0.06,
         product_multiplier=product_mult
     )
-    forecast=simulate_monthly_demand(personas, cfg, cal, channels, feature_text, export_csv=True)
-    SOURCES.to_json(result_path('sources_used.json')); _write_solution_outline(forecast, persona_count, category, concept, price, pack)
+    forecast=simulate_monthly_demand(personas, cfg, cal, channels, feature_text, export_csv=False, rng=rng)
+    forecast.attrs["persona_source"] = persona_source
+    forecast.attrs["persona_count"] = len(personas)
     return forecast, personas
 
-def _write_solution_outline(forecast:pd.DataFrame, persona_count:int, category:str, concept:str, price:int, pack:str):
+def _write_solution_outline(forecast:pd.DataFrame, persona_count:int, category:str, concept:str, price:int, pack:str,
+                            persona_source:str="", price_source:str="", seed:Optional[int]=None, product_name:str=""):
     last=forecast.tail(1).iloc[0]
     md=(f"# 솔루션 설명 자료(초안)\n"
-        f"## 개요\n- 카테고리:{category}\n- 컨셉:{concept}\n- 가격:{price:,} / {pack}\n- 페르소나:{persona_count}\n"
-        f"## 핵심결과\n- 12M 합계:{int(forecast['total_units'].sum()):,} EA\n"
+        f"## 개요\n- 제품:{product_name}\n- 카테고리:{category}\n- 컨셉:{concept}\n"
+        f"- 가격:{price:,} / {pack} (source: {price_source})\n"
+        f"- 페르소나:{persona_count} ({persona_source})\n- seed:{seed}\n"
+        f"## 핵심결과 (Monte Carlo 월별 중앙값)\n- 12M 합계:{int(forecast['total_units'].sum()):,} EA\n"
         f"- 런칭월:{int(forecast.iloc[0]['total_units']):,} EA\n- 최종월:{int(last['total_units']):,} EA\n")
     with open(result_path('solution_report.md'),'w',encoding='utf-8') as f: f.write(md)
 
 # ---------- One product → 12m (MC 앙상블) ----------
 def forecast_one_product(row:pd.Series, persona_count:int=400, use_llm:bool=False,
-                         mc_runs:int=7, persona_cache_dir:str=str(CACHE_DIR))->np.ndarray:
-    global RNG
+                         mc_runs:int=7, persona_cache_dir:str=str(CACHE_DIR),
+                         seed:int=DEFAULT_SEED, info:Optional[dict]=None)->np.ndarray:
     name=str(row.get('product_name','')).strip()
     feat=str(row.get('product_feature','')).strip()
     c1=str(row.get('category_level_1','')); c2=str(row.get('category_level_2','')); c3=str(row.get('category_level_3',''))
 
-    seed=abs(hash(name))%(2**32-1)
-    price=_estimate_list_price(row)
+    pseed=product_seed(seed, name)
+    price, price_source = resolve_price(row)
     market_size=_infer_market_size(name,c2); channels=_infer_channels(c1,c2,c3); competitors=_infer_competitors(c2)
     cal=default_calendar(price); enrich_calendar_from_features(cal, feat, name); apply_category_seasonality(cal, c2)
 
@@ -607,29 +705,59 @@ def forecast_one_product(row:pd.Series, persona_count:int=400, use_llm:bool=Fals
     if '광고모델' in feat and any(k in feat for k in ['안유진','아이돌','연예인']): ad_mult=1.15
     size,unit=_extract_size(name); pack=f"{int(size)}{unit}"
 
-    preds=[]
+    preds=[]; counts=[]; sources=set()
     for r in range(mc_runs):
-        RNG=np.random.default_rng(seed + r*1337); random.seed(seed + r*7331)
-        df,_=run_scenario(persona_count, use_llm, c1 or '식품', feat[:80] or '신제품',
+        rng=np.random.default_rng([pseed, r])
+        df,personas=run_scenario(persona_count, use_llm, c1 or '식품', feat[:80] or '신제품',
                           price, pack, channels, competitors, market_size, cal, ad_mult,
-                          feature_text=feat, persona_cache_dir=persona_cache_dir)
+                          feature_text=feat, persona_cache_dir=persona_cache_dir,
+                          rng=rng, product_name=name, write_artifacts=(r==0))
         preds.append(np.maximum(0, np.array(df['total_units'].values)))
+        counts.append(len(personas)); sources.add(df.attrs.get("persona_source"))
     y = np.rint(np.median(np.stack(preds, axis=0), axis=0)).astype(int)
+    if info is not None:
+        info.update({"product_name": name, "price_krw": price, "price_source": price_source,
+                     "market_size": market_size, "persona_requested": persona_count,
+                     "persona_used_min": min(counts), "persona_used_max": max(counts),
+                     "persona_source": ",".join(sorted(s for s in sources if s)),
+                     "seed": seed, "product_seed": pseed, "mc_runs": mc_runs,
+                     "total_12m": int(y.sum())})
+        info["_monthly"] = df; info["_pack"] = pack; info["_category"] = c1 or '식품'; info["_concept"] = feat[:80] or '신제품'
     return y
 
 # ---------- Submission ----------
-def make_submission(product_info_csv:str, out_csv:str='submission.csv', persona_count:int=400,
+def make_submission(product_info_csv:str, out_csv:Optional[str]=None, persona_count:int=400,
                     use_llm:bool=False, mc_runs:int=7,
-                    persona_cache_dir:str=str(CACHE_DIR))->pd.DataFrame:
+                    persona_cache_dir:str=str(CACHE_DIR), seed:int=DEFAULT_SEED)->pd.DataFrame:
+    """Write the submission plus run_summary.csv (price/persona provenance per product).
+
+    For the last product, monthly_forecast.csv holds the components of its final
+    Monte Carlo run and solution_report.md its submitted per-month median.
+    """
+    out_csv = out_csv or str(result_path('submission.csv'))
     prod=pd.read_csv(product_info_csv)
-    rows=[]
+    rows=[]; summary=[]; info={}
     for _,row in prod.iterrows():
+        info={}
         y=forecast_one_product(row, persona_count, use_llm, mc_runs=mc_runs,
-                               persona_cache_dir=persona_cache_dir)
+                               persona_cache_dir=persona_cache_dir, seed=seed, info=info)
         rows.append({'product_name':row['product_name'],
                      **{f'months_since_launch_{i+1}':int(y[i]) for i in range(12)}})
+        summary.append({k:v for k,v in info.items() if not k.startswith('_')})
     sub=pd.DataFrame(rows)
     sub.to_csv(out_csv,index=False)
+    summ=pd.DataFrame(summary)
+    summ.to_csv(result_path('run_summary.csv'),index=False)
+    short=summ[summ['persona_used_min']<summ['persona_requested']]
+    if len(short):
+        LOG.warning("[personas] %d of %d products ran with fewer personas than requested (%d)",
+                    len(short), len(summ), persona_count)
+    if info:
+        info["_monthly"].to_csv(result_path('monthly_forecast.csv'),index=False)
+        _write_solution_outline(pd.DataFrame({"total_units": y}), info["persona_used_max"], info["_category"], info["_concept"],
+                                info["price_krw"], info["_pack"], info["persona_source"], info["price_source"],
+                                seed, info["product_name"])
+    SOURCES.to_json(result_path('sources_used.json'))
     return sub
 
 # ---------- (선택) 간단 캘리브레이션 ----------
@@ -742,54 +870,53 @@ def build_category_prices(product_info_csv, out_csv="category_prices.csv",
     print("Saved:", out_csv)
     return df
 
-# Step2. LightGBM 학습
-def train_price_model(csv_path="category_prices.csv"):
+# Step2. Price model: leave-one-out comparison against the category-median baseline
+def evaluate_price_model(csv_path:str=PRICES_CSV)->dict:
+    """Leave-one-out MAE/MAPE for the category-median baseline and two LightGBM settings."""
+    if not _HAS_LGBM:
+        raise RuntimeError("lightgbm 미설치. `pip install lightgbm` 후 재시도하세요.")
+    df = load_observed_prices(csv_path)
+    if len(df) < 3:
+        raise ValueError("학습 가능한 행이 부족합니다.")
+    y = df["list_price"].astype(float).values
+    X = _price_features(df)
+    preds = {"category_median": [], "lgbm_original": [], "lgbm_small_data": []}
+    for i in range(len(df)):
+        train = np.arange(len(df)) != i
+        med, _ = category_median_price(df.iloc[i], df, exclude_name=df["product_name"].iloc[i])
+        preds["category_median"].append(med)
+        for key, small in (("lgbm_original", False), ("lgbm_small_data", True)):
+            m = _make_lgbm(small)
+            m.fit(X[train], y[train], categorical_feature=_CAT_COLS)
+            preds[key].append(float(m.predict(X.iloc[[i]])[0]))
+    out = {"n": int(len(df))}
+    for k, v in preds.items():
+        v = np.asarray(v, dtype=float)
+        out[k] = {"mae": float(np.mean(np.abs(v - y))), "mape": float(np.mean(np.abs(v - y) / y))}
+    return out
+
+def train_price_model(csv_path:str=PRICES_CSV):
+    """Fit LightGBM on all observed prices, but save it only if it beats the baseline on LOO."""
     if not _HAS_LGBM or not _HAS_JOBLIB:
         raise RuntimeError("lightgbm/joblib 미설치. `pip install lightgbm joblib` 후 재시도하세요.")
-    df = pd.read_csv(csv_path).dropna(subset=["list_price"])
-    if df.empty:
-        raise ValueError("학습 가능한 행이 없습니다(list_price NaN).")
-
-    y = df["list_price"].astype(float).values
-
-    # ▶︎ feature 준비
-    X = df[["pack_size_value","pack_size_unit","category_level_1",
-            "category_level_2","category_level_3","product_name"]].copy()
-
-    # 수치형
-    X["pack_size_value"] = pd.to_numeric(X["pack_size_value"], errors="coerce").fillna(0).astype(int)
-    X["pack_size_unit"] = X["pack_size_unit"].map({"g":0,"ml":1,"mL":1}).fillna(0).astype(int)
-
-    # 키워드 파생
-    pn = X["product_name"].astype(str).fillna("")
-    X["is_premium"]     = pn.str.contains("프리미엄", na=False).astype(int)
-    X["is_high_protein"]= pn.str.contains("고단백", na=False).astype(int)
-    X["is_lactofree"]   = pn.str.contains("락토프리", na=False).astype(int)
-
-    # 문자열 카테고리 → pandas category
-    for c in ["category_level_1","category_level_2","category_level_3"]:
-        X[c] = X[c].astype("string").fillna("NA").astype("category")
-
-    # 더 이상 product_name은 사용 안 함
-    X = X.drop(columns=["product_name"])
-
-    from sklearn.model_selection import train_test_split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-
-    # ▶︎ LightGBM에 카테고리 컬럼 알려주기
-    cat_cols = ["category_level_1","category_level_2","category_level_3"]
-
-    model = lgb.LGBMRegressor(n_estimators=500, learning_rate=0.05, max_depth=7)
-    model.fit(X_train, y_train, categorical_feature=cat_cols)
-
-    print("Train R2:", model.score(X_train, y_train))
-    print("Test  R2:", model.score(X_test, y_test))
-
-    joblib.dump(model, MODEL_PATH)
-    print(f"Saved {MODEL_PATH}")
-    return model
+    metrics = evaluate_price_model(csv_path)
+    base = metrics["category_median"]["mae"]
+    print(f"Leave-one-out on {metrics['n']} observed prices (KRW):")
+    for k in ("category_median", "lgbm_original", "lgbm_small_data"):
+        print(f"  {k:16s} MAE {metrics[k]['mae']:>9,.0f}   MAPE {metrics[k]['mape']:.1%}")
+    best = min(("lgbm_original", "lgbm_small_data"), key=lambda k: metrics[k]["mae"])
+    if metrics[best]["mae"] >= base:
+        print("No LightGBM setting beats the category-median baseline; no model saved.")
+        return None
+    df = load_observed_prices(csv_path)
+    X = _price_features(df)
+    model = _make_lgbm(best == "lgbm_small_data")
+    model.fit(X, df["list_price"].astype(float).values, categorical_feature=_CAT_COLS)
+    bundle = {"model": model, "setting": best, "metrics": metrics, "beats_baseline": True,
+              "categories": {c: list(X[c].cat.categories.astype(str)) for c in _CAT_COLS}}
+    joblib.dump(bundle, MODEL_PATH)
+    print(f"Saved {MODEL_PATH} ({best})")
+    return bundle
 
 # ===================== CLI =====================
 if __name__ == '__main__':
@@ -809,11 +936,12 @@ if __name__ == '__main__':
         p_gp.add_argument("--naver_client_secret", default=os.environ.get("NAVER_CLIENT_SECRET"))
 
         p_tm = sub.add_parser("train_price_model")
-        p_tm.add_argument("--prices_csv", default="category_prices.csv")
+        p_tm.add_argument("--prices_csv", default=PRICES_CSV)
 
         p_ms = sub.add_parser("make_submission")
         p_ms.add_argument("--product_csv", required=True)
-        p_ms.add_argument("--out_csv", default="submission.csv")
+        p_ms.add_argument("--out_csv", default=None, help="default: results/submission.csv")
+        p_ms.add_argument("--seed", type=int, default=DEFAULT_SEED, help="base random seed (default 42)")
         p_ms.add_argument("--persona_count", type=int, default=400)
         p_ms.add_argument("--use_llm", type=int, default=0)   # 0/1
         p_ms.add_argument("--mc_runs", type=int, default=7)
@@ -821,6 +949,7 @@ if __name__ == '__main__':
         p_ms.add_argument("--persona_cache_dir", default=str(CACHE_DIR))
 
         args = p.parse_args()
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
         if args.cmd == "gather_prices":
             build_category_prices(args.product_csv, args.out_csv, args.naver_client_id, args.naver_client_secret)
@@ -833,15 +962,16 @@ if __name__ == '__main__':
                                     persona_count=args.persona_count,
                                     use_llm=bool(args.use_llm),
                                     mc_runs=args.mc_runs,
-                                    persona_cache_dir=args.persona_cache_dir)
+                                    persona_cache_dir=args.persona_cache_dir,
+                                    seed=args.seed)
             print(subdf.head())
-            print("Files: submission.csv, monthly_forecast.csv, persona_single_turn_prompt.txt/.pdf, sources_used.json, solution_report.md")
+            print("Files in results/: submission.csv, run_summary.csv, monthly_forecast.csv, persona_single_turn_prompt.txt/.pdf, sources_used.json, solution_report.md")
 
         else:
             # 기본 동작
             try:
-                subdf = make_submission('product_info.csv','submission.csv',
-                                        persona_count=400, use_llm=False, mc_runs=7)
+                subdf = make_submission(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'product_info.csv'),
+                                        persona_count=400, use_llm=False, mc_runs=7, seed=DEFAULT_SEED)
                 print(subdf.head())
                 print("Files: submission.csv, monthly_forecast.csv, persona_single_turn_prompt.txt/.pdf, sources_used.json, solution_report.md")
             except Exception as e:

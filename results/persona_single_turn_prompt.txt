@@ -3,11 +3,11 @@ Return **valid JSON** only (list of persona objects).
 Context:
 - Category: 조미소스
 - Product concept: 훈연참치추출물 80%, 참기엑기스, 참치명가, 직접 잡은 참치, 가쓰오엑기스, 표고버섯, 무, 감초, 마늘
-- Target price (KRW): 14093
+- Target price (KRW): 22400
 - Packaging/size: 900g
 - Channels: hypermarket, ecommerce
 - Competitors: CJ, 오뚜기
-- Target market size (12-month addressable): 5,400,000
+- Target market size (12-month addressable): 5,100,000
 - Launch months: 2024-07 to 2025-06
 
 Each persona fields:
