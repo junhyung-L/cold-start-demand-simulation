@@ -1,0 +1,14 @@
+# Minimum versions are the ones installed when this file was checked (Python 3.13.2).
+# Core simulation: forecast_pipeline.py make_submission --use_llm 0
+numpy>=2.4
+pandas>=3.0
+# Price model (train_price_model) and its loader
+lightgbm>=4.6
+joblib>=1.5
+scikit-learn>=1.6
+# Optional: calibration helper, Naver price collection, prompt PDF export
+scipy>=1.17
+requests>=2.32
+reportlab>=4.5
+# Optional: Gemini personas (--use_llm 1, needs GOOGLE_API_KEY); not installed locally, so unpinned
+google-generativeai
