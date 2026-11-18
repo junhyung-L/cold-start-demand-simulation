@@ -1,21 +1,19 @@
 # Cold-Start Demand Simulation for New Products
 
-[한국어](README.ko.md) · [Case study](PORTFOLIO.md)
+Persona-based Monte Carlo simulator for 15 new food products without sales
+history; awareness, trial, repeat, and price elasticity are editable inputs.
+Built for the 2025 Dongwon x KAIST AI Competition (August to September 2025).
 
-Generates 12-month demand scenarios for 15 new food products with no sales
-history by simulating synthetic consumer personas month by month under price,
-promotion, advertising, distribution, and seasonality assumptions. Built for
-the 2025 Dongwon x KAIST AI Competition (August to September 2025).
+**Problem.** Launch volumes, inventory, and promotion timing must be planned
+before any sales exist, so a forecasting model has no target. The simulator
+turns each assumption (price, promotion, advertising, distribution,
+seasonality) into an explicit input and produces 12-month demand scenarios.
 
-**Why it matters:** launch volumes, inventory, and promotion timing must be
-planned before any sales exist, so a forecasting model has no target. The
-pipeline turns each assumption into an explicit, editable input.
+**Result.** In a single run with 3 personas, a 900 g premium tuna-extract
+seasoning sauce totals 7,207,421 simulated units over 12 months. This is a
+scenario, not a forecast-accuracy result.
 
-**Example scenario:** for a 900 g premium tuna-extract seasoning sauce, one
-stored Monte Carlo run produces 7,207,421 simulated units over 12 months,
-rising from 123,287 in the launch month to 1,321,951 in month 12 as assumed
-distribution coverage ramps from 35% to 100% and repeat purchases accumulate.
-This is a scenario, not a forecast-accuracy result.
+[한국어](README.ko.md) · [Case study](PORTFOLIO.md) · [Architecture](docs/ARCHITECTURE.md)
 
 ## Data and assumptions
 
@@ -24,11 +22,10 @@ This is a scenario, not a forecast-accuracy result.
   category.
 - [`data/category_prices.csv`](data/category_prices.csv): 15 list prices
   collected from Naver Shopping on 2025-08-26.
-- Hand-set defaults in `forecast_pipeline.py` (no
-  `results/calibrated_theta.json` exists): base awareness 0.18, trial rate 0.35,
-  repeat rate 0.55, price elasticity -1.2, ad effect 0.10 per 100 GRP (gross
-  rating points), promotion pass-through 0.8. Market size is a per-category
-  heuristic.
+- Hand-set defaults in `forecast_pipeline.py`: base awareness 0.18, trial rate
+  0.35, repeat rate 0.55, price elasticity -1.2, ad effect 0.10 per 100 GRP
+  (gross rating points), promotion pass-through 0.8. Market size is a
+  per-category heuristic.
 
 ## Scenario design
 
@@ -50,32 +47,24 @@ x mean purchase probability; repeat units grow with cumulative trials. Each
 product runs several Monte Carlo times and the submission keeps the per-month
 median. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Findings
+## Results
 
-| Retained run (premium seasoning sauce 900 g) | Value | Source |
-|---|---:|---|
-| Month 1 simulated units | 123,287 | `results/monthly_forecast.csv` |
-| Month 12 simulated units | 1,321,951 | `results/monthly_forecast.csv` |
-| 12-month total | 7,207,421 | `results/solution_report.md` |
-| Price input | KRW 14,093 | `results/solution_report.md` |
+| Single run, 3 personas (premium seasoning sauce 900 g) | Value |
+|---|---:|
+| Month 1 simulated units | 123,287 |
+| Month 12 simulated units | 1,321,951 |
+| 12-month total | 7,207,421 |
+| Price input | KRW 14,093 |
 
-Two inputs behind this run, from the notebook log
-(`notebooks/02_final_demand_forecast.ipynb`):
+Growth comes from the assumed distribution ramp (35% to 100% coverage) and
+repeat purchases that scale with cumulative trial units. Trial units are not
+removed from the untried pool, so cumulative trial units are purchase volume,
+not unique buyers.
 
-- **Price.** The LightGBM price model, trained on 12 of the 15 observed prices,
-  found no split (train R² 0.0, test R² -0.18) and returns the training mean,
-  KRW 14,093, for every product, so the scenarios do not differ by price.
-- **Personas.** `persona_count` was 400, but the Gemini call returned 3
-  personas for this product, and those cached 3 were reused across all seven
-  runs. The report prints the requested 400.
-
-## Run
-
-Scripts compile and `--help` runs under Python 3.13.2.
+## How to run
 
 ```powershell
 pip install -r requirements.txt
-python forecast_pipeline.py make_submission --help
 python forecast_pipeline.py make_submission `
   --product_csv data\product_info.csv `
   --out_csv results\submission.csv `
@@ -86,17 +75,15 @@ python forecast_pipeline.py make_submission `
 (`--use_llm 1`) need `GOOGLE_API_KEY` and the `google-generativeai` package;
 `gather_prices` needs Naver API credentials. Without `results/price_model.pkl`
 the rule-based price table is used, so a fresh run will differ from the
-retained scenario. Outputs go to `results/` (forecast, prompt, sources,
-report) and `persona_cache/`.
+scenario above. Reruns are not bit-identical unless `PYTHONHASHSEED` is fixed.
+Outputs go to `results/` and `persona_cache/`.
 
 ## Limitations
 
 - Simulation, not forecast: no observed sales, backtest, or competition score.
-- No sensitivity sweep yet, so which assumption moves the total most is unmeasured.
-- With 15 price observations the price model is constant (see Findings).
-- Reruns are not bit-identical: per-product seeds and market sizes come from Python's per-process string hash (unless `PYTHONHASHSEED` is fixed), and rule-based personas and noise use NumPy's unseeded global generator.
-- Trial units are not removed from the untried pool, so cumulative trial units are purchase volume, not unique buyers.
-- `results/solution_report.md` and `results/monthly_forecast.csv` hold the last Monte Carlo run of the last product; run settings for the 15-product `results/submission_3.csv` are not recorded.
+- Only 3 personas: `persona_count` was 400, but Gemini returned 3 personas for this product, and those 3 were reused across all seven Monte Carlo runs.
+- Price does not differentiate products: the LightGBM price model, trained on 12 of the 15 observed prices, found no split (train R² 0.0000, test R² -0.1779) and returns KRW 14,093 for every product.
+- No sensitivity sweep, so which assumption moves the total most is unmeasured.
 
 ## Repository layout
 
@@ -106,11 +93,10 @@ project_config.py        result, cache, model, and calibration paths
 simulation_pipeline.py   separate simplified example, not the maintained engine
 data/                    product list and 15 observed prices
 notebooks/               experiment and final-run notebooks with saved outputs
-results/                 retained scenario, prompt, sources, submission file
+results/                 scenario report, monthly forecast, prompt, sources, submission file
 ```
 
 ## Documentation
 
 - [Portfolio case study](PORTFOLIO.md)
 - [Architecture](docs/ARCHITECTURE.md)
-- [Project review](docs/PROJECT_REVIEW.md)
